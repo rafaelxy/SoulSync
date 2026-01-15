@@ -275,7 +275,15 @@ watchlist_auto_scanning_timestamp = 0  # Timestamp when scanning started (for st
 watchlist_next_run_time = 0  # Timestamp when next auto-scanning is scheduled (for countdown display)
 watchlist_timer_lock = threading.Lock()  # Thread safety for timer operations
 
+# --- Playlist Assembly Tracker ---
+# Tracks downloaded tracks by source playlist for creating Jellyfin playlists after sync downloads complete
+# This enables automatic playlist creation in Jellyfin when songs from a Spotify playlist sync are downloaded
+playlist_download_tracker = {}  # {playlist_id: [spotify_track_ids that were downloaded]}
+playlist_download_metadata = {}  # {playlist_id: {name, batch_id, created: bool, last_activity: timestamp}}
+playlist_tracker_lock = threading.Lock()  # Thread safety for tracker operations
+
 # --- Shared Transfer Data Cache ---
+
 # Cache transfer data to avoid hammering the Soulseek API with multiple concurrent modals
 transfer_data_cache = {
     'data': {},
@@ -3957,13 +3965,12 @@ def get_download_status():
                                     context_key = f"{username}::{extract_filename(filename_from_api)}"
                                     with matched_context_lock:
                                         context = matched_downloads_context.get(context_key)
-                                        if context:
-                                            print(f"✅ [Context Lookup] Found context for key: {context_key}")
-                                        else:
+                                        if not context:
                                             print(f"⚠️ [Context Lookup] No context found for key: {context_key}")
                                             print(f"   Available keys: {list(matched_downloads_context.keys())[:5]}...")  # Show first 5 keys
 
                                     if context and context_key not in _processed_download_ids:
+                                        print(f"✅ [Context Lookup] Found NEW context for key: {context_key}")
                                         download_dir = docker_resolve_path(config_manager.get('soulseek.download_path', './downloads'))
                                         # Use the new robust file finder (only search downloads for post-processing candidates)
                                         found_result = _find_completed_file_robust(download_dir, filename_from_api)
@@ -8445,6 +8452,7 @@ def _check_and_remove_from_wishlist(context):
     """
     Check if a successfully downloaded track should be removed from wishlist.
     Extracts Spotify track data from download context and removes from wishlist if found.
+    Also registers the track for playlist assembly if it came from a playlist sync.
     """
     try:
         from core.wishlist_service import get_wishlist_service
@@ -8452,6 +8460,10 @@ def _check_and_remove_from_wishlist(context):
         
         # Try to extract Spotify track ID from various sources in the context
         spotify_track_id = None
+        source_playlist_id = None
+        source_playlist_name = None
+        wl_track_name = None  # Track name for playlist assembly
+        wl_artist_name = None  # Artist name for playlist assembly
         
         # Method 1: Direct track_info with id
         track_info = context.get('track_info', {})
@@ -8475,7 +8487,32 @@ def _check_and_remove_from_wishlist(context):
                 if wl_track.get('wishlist_id') == wishlist_id:
                     spotify_track_id = wl_track.get('spotify_track_id') or wl_track.get('id')
                     print(f"📋 [Wishlist] Found Spotify ID from wishlist entry: {spotify_track_id}")
+                    
+                    # Extract source info for playlist assembly
+                    source_info = wl_track.get('source_info', {})
+                    if isinstance(source_info, str):
+                        import json
+                        try:
+                            source_info = json.loads(source_info)
+                        except:
+                            source_info = {}
+                    
+                    if wl_track.get('source_type') == 'playlist' and source_info:
+                        source_playlist_id = source_info.get('playlist_id')
+                        source_playlist_name = source_info.get('playlist_name')
+                        print(f"📋 [Wishlist] Track from playlist source: '{source_playlist_name}' (ID: {source_playlist_id})")
+                        
+                        # Extract track metadata for playlist assembly lookup
+                        wl_track_name = wl_track.get('name', '')
+                        wl_artists = wl_track.get('artists', [])
+                        wl_artist_name = ''
+                        if wl_artists:
+                            if isinstance(wl_artists[0], dict):
+                                wl_artist_name = wl_artists[0].get('name', '')
+                            else:
+                                wl_artist_name = str(wl_artists[0])
                     break
+
         
         # Method 4: Try to construct ID from track metadata for fuzzy matching
         if not spotify_track_id:
@@ -8503,7 +8540,31 @@ def _check_and_remove_from_wishlist(context):
                     if (wl_name == track_name.lower() and wl_artist_name == artist_name.lower()):
                         spotify_track_id = wl_track.get('spotify_track_id') or wl_track.get('id')
                         print(f"📋 [Wishlist] Found fuzzy match - Spotify ID: {spotify_track_id}")
+                        
+                        # Extract source info for playlist assembly
+                        source_info = wl_track.get('source_info', {})
+                        if isinstance(source_info, str):
+                            import json
+                            try:
+                                source_info = json.loads(source_info)
+                            except:
+                                source_info = {}
+                        
+                        if wl_track.get('source_type') == 'playlist' and source_info:
+                            source_playlist_id = source_info.get('playlist_id')
+                            source_playlist_name = source_info.get('playlist_name')
+                            print(f"📋 [Wishlist] Track from playlist source: '{source_playlist_name}' (ID: {source_playlist_id})")
+                            
+                            # Extract track metadata for playlist assembly lookup
+                            wl_track_name = wl_track.get('name', '')
+                            wl_artists_data = wl_track.get('artists', [])
+                            if wl_artists_data:
+                                if isinstance(wl_artists_data[0], dict):
+                                    wl_artist_name = wl_artists_data[0].get('name', '')
+                                else:
+                                    wl_artist_name = str(wl_artists_data[0])
                         break
+
         
         # If we found a Spotify track ID, remove it from wishlist
         if spotify_track_id:
@@ -8511,6 +8572,18 @@ def _check_and_remove_from_wishlist(context):
             removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
             if removed:
                 print(f"✅ [Wishlist] Successfully removed track from wishlist: {spotify_track_id}")
+                
+                # Register for playlist assembly if this track came from a playlist sync
+                if source_playlist_id and source_playlist_name:
+                    batch_id = context.get('batch_id')
+                    _register_downloaded_track_for_playlist(
+                        playlist_id=source_playlist_id,
+                        playlist_name=source_playlist_name,
+                        spotify_track_id=spotify_track_id,
+                        track_name=wl_track_name,
+                        artist_name=wl_artist_name,
+                        batch_id=batch_id
+                    )
             else:
                 print(f"ℹ️ [Wishlist] Track not found in wishlist or already removed: {spotify_track_id}")
         else:
@@ -8588,6 +8661,188 @@ def _check_and_remove_track_from_wishlist_by_metadata(track_data):
         import traceback
         traceback.print_exc()
         return False
+
+def _register_downloaded_track_for_playlist(playlist_id: str, playlist_name: str, spotify_track_id: str, 
+                                              track_name: str = None, artist_name: str = None, batch_id: str = None):
+    """
+    Register a downloaded track as belonging to a specific source playlist.
+    This enables automatic Jellyfin playlist creation after downloads complete.
+    
+    Args:
+        playlist_id: Spotify playlist ID
+        playlist_name: Name of the playlist (for Jellyfin playlist creation)
+        spotify_track_id: Spotify track ID that was downloaded
+        track_name: Name of the track (stored for later lookup)
+        artist_name: Primary artist name (stored for later lookup)
+        batch_id: Optional batch ID for tracking download batches
+    """
+    try:
+        with playlist_tracker_lock:
+            # Initialize playlist tracker if needed
+            if playlist_id not in playlist_download_tracker:
+                playlist_download_tracker[playlist_id] = []
+                playlist_download_metadata[playlist_id] = {
+                    'name': playlist_name,
+                    'batch_id': batch_id,
+                    'created': False,
+                    'last_activity': time.time(),
+                    'track_metadata': {}  # Store track info for later lookup
+                }
+                print(f"📋 [Playlist Assembly] Initialized tracker for playlist '{playlist_name}' (ID: {playlist_id})")
+            
+            # Add track if not already registered
+            if spotify_track_id not in playlist_download_tracker[playlist_id]:
+                playlist_download_tracker[playlist_id].append(spotify_track_id)
+                playlist_download_metadata[playlist_id]['last_activity'] = time.time()
+                
+                # Store track metadata for later lookup (avoids wishlist dependency at playlist creation time)
+                if track_name and artist_name:
+                    playlist_download_metadata[playlist_id]['track_metadata'][spotify_track_id] = {
+                        'name': track_name,
+                        'artist': artist_name
+                    }
+                
+                print(f"📋 [Playlist Assembly] Registered track '{track_name or spotify_track_id}' for playlist '{playlist_name}' " + 
+                      f"({len(playlist_download_tracker[playlist_id])} tracks total)")
+            else:
+                print(f"📋 [Playlist Assembly] Track '{spotify_track_id}' already registered for playlist '{playlist_name}'")
+                
+    except Exception as e:
+        print(f"❌ [Playlist Assembly] Error registering track for playlist: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def _create_jellyfin_playlist_for_sync(playlist_id: str, force: bool = False):
+    """
+    Check if we should create a Jellyfin playlist for downloaded tracks from a sync.
+    Creates the playlist if all tracks have been downloaded or if force=True.
+    
+    Args:
+        playlist_id: Spotify playlist ID to create Jellyfin playlist for
+        force: If True, create playlist even if not all tracks are downloaded (e.g., batch complete)
+    """
+    try:
+        with playlist_tracker_lock:
+            if playlist_id not in playlist_download_tracker:
+                print(f"📋 [Playlist Assembly] No tracked downloads for playlist {playlist_id}")
+                return False
+                
+            metadata = playlist_download_metadata.get(playlist_id, {})
+            playlist_name = metadata.get('name', 'Unknown Playlist')
+            
+            # Check if already created
+            if metadata.get('created', False):
+                print(f"📋 [Playlist Assembly] Playlist '{playlist_name}' already created, skipping")
+                return True
+            
+            downloaded_track_ids = playlist_download_tracker[playlist_id]
+            
+            if not downloaded_track_ids:
+                print(f"📋 [Playlist Assembly] No downloaded tracks for playlist '{playlist_name}'")
+                return False
+            
+            # Mark as created to prevent duplicate creation
+            playlist_download_metadata[playlist_id]['created'] = True
+        
+        print(f"🎵 [Playlist Assembly] Creating Jellyfin playlist '{playlist_name}' with {len(downloaded_track_ids)} tracks...")
+        
+        # Get active media server and look up track IDs in database
+        from config.settings import config_manager
+        from database.music_database import MusicDatabase
+
+        
+        active_server = config_manager.get_active_media_server()
+        
+        if active_server != 'jellyfin':
+            print(f"📋 [Playlist Assembly] Active server is '{active_server}', not 'jellyfin' - skipping Jellyfin playlist creation")
+            # Still consider this successful - just not applicable
+            return True
+        
+        # Get Jellyfin client
+        try:
+            jellyfin_client.ensure_connection()
+        except Exception as jf_error:
+            print(f"❌ [Playlist Assembly] Jellyfin client not connected: {jf_error}")
+            return False
+        
+        db = MusicDatabase()
+        
+        # Get stored track metadata from our tracker
+        track_metadata = metadata.get('track_metadata', {})
+        
+        # For each Spotify track ID, find the corresponding Jellyfin track
+        jellyfin_track_objects = []
+        
+        for spotify_track_id in downloaded_track_ids:
+            # Get track metadata from our stored data (stored at registration time)
+            try:
+                # Use stored metadata from registration (avoids timing issue with wishlist removal)
+                stored_info = track_metadata.get(spotify_track_id, {})
+                track_name = stored_info.get('name', '')
+                artist_name = stored_info.get('artist', '')
+                
+                if not track_name or not artist_name:
+                    print(f"⚠️ [Playlist Assembly] Missing stored metadata for {spotify_track_id}, skipping")
+                    continue
+
+                
+                # Look up in database to get Jellyfin track ID
+                db_track, confidence = db.check_track_exists(
+                    track_name, artist_name,
+                    confidence_threshold=0.7,
+                    server_source='jellyfin'
+                )
+                
+                if db_track and confidence >= 0.7:
+                    # Create a track object with the required ratingKey attribute for Jellyfin
+                    class JellyfinTrackForPlaylist:
+                        def __init__(self, track_id, title):
+                            self.ratingKey = track_id
+                            self.id = track_id
+                            self.title = title
+                    
+                    track_obj = JellyfinTrackForPlaylist(db_track.id, db_track.title)
+                    jellyfin_track_objects.append(track_obj)
+                    print(f"✅ [Playlist Assembly] Found Jellyfin track for '{track_name}': ID={db_track.id}")
+                else:
+                    print(f"⚠️ [Playlist Assembly] Track '{track_name}' not found in Jellyfin database (may still be indexing)")
+                    
+            except Exception as lookup_error:
+                print(f"⚠️ [Playlist Assembly] Error looking up track {spotify_track_id}: {lookup_error}")
+                continue
+        
+        if not jellyfin_track_objects:
+            print(f"⚠️ [Playlist Assembly] No Jellyfin tracks found for playlist '{playlist_name}' - library may need refreshing")
+            # Don't undo the 'created' flag - we tried our best
+            return False
+        
+        # Create the Jellyfin playlist
+        print(f"🎵 [Playlist Assembly] Creating Jellyfin playlist '{playlist_name}' with {len(jellyfin_track_objects)} tracks")
+        success = jellyfin_client.update_playlist(playlist_name, jellyfin_track_objects)
+        
+        if success:
+            print(f"✅ [Playlist Assembly] Successfully created Jellyfin playlist '{playlist_name}' with {len(jellyfin_track_objects)} tracks!")
+            add_activity_item("🎵", "Playlist Created", f"'{playlist_name}' with {len(jellyfin_track_objects)} tracks in Jellyfin", "Now")
+            
+            # Cleanup tracker data
+            with playlist_tracker_lock:
+                if playlist_id in playlist_download_tracker:
+                    del playlist_download_tracker[playlist_id]
+                if playlist_id in playlist_download_metadata:
+                    del playlist_download_metadata[playlist_id]
+            
+            return True
+        else:
+            print(f"❌ [Playlist Assembly] Failed to create Jellyfin playlist '{playlist_name}'")
+            return False
+            
+    except Exception as e:
+        print(f"❌ [Playlist Assembly] Error creating Jellyfin playlist: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 def _automatic_wishlist_cleanup_after_db_update():
     """
@@ -11616,6 +11871,37 @@ def _on_download_completed(batch_id, task_id, success=True):
             
             print(f"🎉 [Batch Manager] Batch {batch_id} complete - stopping monitor")
             download_monitor.stop_monitoring(batch_id)
+            
+            # PLAYLIST ASSEMBLY: Trigger Jellyfin playlist creation for any tracked playlists
+            # This runs in a background thread to avoid blocking batch completion
+            def _trigger_playlist_assembly():
+                try:
+                    # Small delay to allow library scan to index new tracks
+                    time.sleep(5)
+                    
+                    # Check all tracked playlists and attempt creation (with proper locking)
+                    with playlist_tracker_lock:
+                        pending_playlists = []
+                        for playlist_id in list(playlist_download_tracker.keys()):
+                            metadata = playlist_download_metadata.get(playlist_id, {})
+                            if not metadata.get('created', False):
+                                pending_playlists.append(playlist_id)
+                    
+                    if pending_playlists:
+                        print(f"📋 [Playlist Assembly] Batch complete - creating {len(pending_playlists)} pending playlist(s)")
+                        for playlist_id in pending_playlists:
+                            print(f"📋 [Playlist Assembly] Attempting to create playlist for ID: {playlist_id}")
+                            _create_jellyfin_playlist_for_sync(playlist_id, force=True)
+                    else:
+                        print(f"📋 [Playlist Assembly] No pending playlists to create")
+                except Exception as e:
+                    print(f"❌ [Playlist Assembly] Error in batch completion trigger: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Run playlist assembly in background thread
+            threading.Thread(target=_trigger_playlist_assembly, daemon=True).start()
+
             
             # Process wishlist outside of the lock to prevent threading issues
             if is_auto_batch:
