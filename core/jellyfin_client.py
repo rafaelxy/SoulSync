@@ -1,5 +1,6 @@
 import requests
 from typing import List, Optional, Dict, Any
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -553,7 +554,7 @@ class JellyfinClient:
                 
         except Exception as e:
             logger.error(f"Error in targeted cache population: {e}")
-    
+
     def is_connected(self) -> bool:
         """Check if connected to Jellyfin server"""
         if not self._connection_attempted:
@@ -879,6 +880,153 @@ class JellyfinClient:
         except Exception as e:
             logger.error(f"Error getting library stats: {e}")
             return {}
+    
+    def search_tracks_by_metadata(self, title: str, artist: str, confidence_threshold: float = 0.7) -> Optional[JellyfinTrack]:
+        """
+        Search for a track in Jellyfin by title and artist name using the Jellyfin search API.
+        Returns the best matching track if confidence is above threshold, None otherwise.
+        """
+        if not self.ensure_connection() or not self.music_library_id:
+            return None
+        
+        try:
+            # Import string similarity for fuzzy matching
+            try:
+                from difflib import SequenceMatcher
+            except ImportError:
+                logger.warning("difflib not available for fuzzy matching")
+                return None
+            
+            def similarity(a: str, b: str) -> float:
+                """Calculate similarity between two strings (0.0 to 1.0)"""
+                if not a or not b:
+                    return 0.0
+                return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+            
+            # Clean up search terms
+            clean_title = title.strip()
+            clean_artist = artist.strip()
+            
+            # Try searching with combined query first (more specific)
+            search_query = f"{clean_artist} {clean_title}"
+            
+            params = {
+                'ParentId': self.music_library_id,
+                'SearchTerm': search_query,
+                'IncludeItemTypes': 'Audio',
+                'Recursive': True,
+                'Fields': 'AlbumId,ArtistItems',
+                'Limit': 20
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            
+            if not response:
+                # Fallback to title-only search
+                params['SearchTerm'] = clean_title
+                response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            
+            if not response or not response.get('Items'):
+                logger.debug(f"🔍 Jellyfin API: No results for '{clean_title}' by '{clean_artist}'")
+                return None
+            
+            # Score each result
+            best_match = None
+            best_score = 0.0
+            
+            for item in response.get('Items', []):
+                item_title = item.get('Name', '')
+                item_artists = [a.get('Name', '') for a in item.get('ArtistItems', [])]
+                
+                # Calculate title similarity
+                title_score = similarity(clean_title, item_title)
+                
+                # Calculate artist similarity (best match among all artists)
+                artist_score = 0.0
+                for item_artist in item_artists:
+                    score = similarity(clean_artist, item_artist)
+                    if score > artist_score:
+                        artist_score = score
+                
+                # Combined score (weighted: title is more important)
+                combined_score = (title_score * 0.6) + (artist_score * 0.4)
+                
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_match = item
+            
+            if best_match and best_score >= confidence_threshold:
+                logger.info(f"✅ Jellyfin API match: '{clean_title}' by '{clean_artist}' → '{best_match.get('Name')}' (confidence: {best_score:.2f})")
+                return JellyfinTrack(best_match, self)
+            else:
+                logger.warning(f"❌ Jellyfin API: No confident match for '{clean_title}' by '{clean_artist}' (best: {best_score:.2f})")
+                if response.get('Items'):
+                    # Log the best candidate for debugging
+                    logger.warning(f"   Best candidate: {best_match.get('Name') if best_match else 'None'} ({best_score:.2f})")
+                else:
+                    logger.warning(f"   No items returned from API search for '{search_query}'")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error searching Jellyfin for '{title}' by '{artist}': {e}")
+            return None
+
+    def get_track_by_filename(self, filename: str) -> Optional[JellyfinTrack]:
+        """
+        Try to find a track in Jellyfin by its filename.
+        Useful when we've found the file on disk and want to get its Jellyfin ID.
+        """
+        if not self.ensure_connection() or not self.music_library_id:
+            logger.warning("Cannot resolve filename: Not connected or no music library ID")
+            return None
+            
+        try:
+            # Search using the filename stem (no extension)
+            search_term = Path(filename).stem
+            
+            # Try to strip track numbers "26 - Title" -> "Title"
+            import re
+            clean_search = re.sub(r'^\d+\s*-\s*', '', search_term)
+            clean_search = re.sub(r'^\d+\s+', '', clean_search)
+            
+            logger.info(f"🔍 Resolving filename '{filename}' -> search term: '{clean_search}'")
+            
+            params = {
+                'ParentId': self.music_library_id,
+                'SearchTerm': clean_search,
+                'IncludeItemTypes': 'Audio',
+                'Recursive': True,
+                'Fields': 'Path,AlbumId,ArtistItems',
+                'Limit': 10
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            
+            if not response or not response.get('Items'):
+                logger.warning(f"❌ No items found for filename search '{clean_search}'")
+                return None
+                
+            # Iterate and check for exact filename match if Path is available
+            for item in response.get('Items', []):
+                item_path = item.get('Path', '')
+                if item_path and filename in item_path:
+                    logger.info(f"✅ Resolved Jellyfin ID by filename: {filename} -> {item.get('Id')}")
+                    return JellyfinTrack(item, self)
+            
+            # If no path match, check name match
+            for item in response.get('Items', []):
+                if item.get('Name', '').lower() == clean_search.lower():
+                     logger.info(f"✅ Resolved Jellyfin ID by exact name match: {filename} -> {item.get('Id')}")
+                     return JellyfinTrack(item, self)
+
+            logger.warning(f"❌ Found {len(response.get('Items'))} items but none matched filename '{filename}'")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error resolving track by filename {filename}: {e}")
+            return None
+
+
     
     def clear_cache(self):
         """Clear all caches to force fresh data on next request"""

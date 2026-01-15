@@ -2,6 +2,9 @@ import asyncio
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
+import os
+import glob
+from pathlib import Path
 from utils.logging_config import get_logger
 from core.spotify_client import SpotifyClient, Playlist as SpotifyPlaylist, Track as SpotifyTrack
 from core.plex_client import PlexClient, PlexTrackInfo
@@ -341,25 +344,48 @@ class PlaylistSyncService:
             self._cancelled = False
     
     async def _find_track_in_media_server(self, spotify_track: SpotifyTrack) -> Tuple[Optional[PlexTrackInfo], float]:
-        """Find a track using the same improved database matching as Download Missing Tracks modal"""
+        """
+        Find a track with the following priority:
+        1. Jellyfin API (direct search on media server)
+        2. Filesystem (check transfer_path)
+        3. Database (metadata match)
+        """
         try:
             # Check active media server connection
             media_client, server_type = self._get_active_media_client()
+            
+            # STEP 1: Check Jellyfin API directly (highest priority)
+            # This handles cases where tracks exist on server but not in local DB (dev vs docker mismatch)
+            if server_type == "jellyfin" and media_client:
+                jellyfin_match = await self._check_jellyfin_api(media_client, spotify_track)
+                if jellyfin_match:
+                    return jellyfin_match, 1.0
+            
+            # STEP 2: Check filesystem in transfer_path
+            # This handles cases where files are downloaded/moved but not yet scanned by Jellyfin
+            file_match = self._check_filesystem(spotify_track, media_client)
+            if file_match:
+                # Return a minimal track object that can be used for playlist creation
+                # Note: These won't work for playlist creation unless added to Jellyfin first,
+                # but it prevents re-downloading.
+                return file_match, 0.95
+
+            # STEP 3: Fall back to database check (existing logic)
             if not media_client or not media_client.is_connected():
                 logger.warning(f"{server_type.upper()} client not connected")
                 return None, 0.0
             
-            # Use the SAME improved database matching as PlaylistTrackAnalysisWorker
+            # Use improved database matching from prior logic
             from database.music_database import MusicDatabase
             
             original_title = spotify_track.name
             
-            # Try each artist (same as modal logic)
+            # Try each artist
             for artist in spotify_track.artists:
                 if self._cancelled:
                     return None, 0.0
 
-                # Extract artist name from both string and dict formats
+                # Extract artist name
                 if isinstance(artist, str):
                     artist_name = artist
                 elif isinstance(artist, dict) and 'name' in artist:
@@ -367,7 +393,7 @@ class PlaylistSyncService:
                 else:
                     artist_name = str(artist)
                 
-                # Use the improved database check_track_exists method with server awareness
+                # Database check
                 try:
                     from config.settings import config_manager
                     active_server = config_manager.get_active_media_server()
@@ -377,10 +403,9 @@ class PlaylistSyncService:
                     if db_track and confidence >= 0.7:
                         logger.debug(f"✔️ Database match found for '{original_title}' by '{artist_name}': '{db_track.title}' with confidence {confidence:.2f}")
                         
-                        # Fetch the actual track object from active media server using the database track ID
+                        # Fetch/Create the actual track object
                         try:
                             if server_type == "jellyfin":
-                                # For Jellyfin, create a track object from database info (Jellyfin doesn't have fetchItem)
                                 class JellyfinTrackFromDB:
                                     def __init__(self, db_track):
                                         self.ratingKey = db_track.id
@@ -388,10 +413,10 @@ class PlaylistSyncService:
                                         self.id = db_track.id
                                 
                                 actual_track = JellyfinTrackFromDB(db_track)
-                                logger.debug(f"✔️ Created Jellyfin track object for '{db_track.title}' (ID: {actual_track.ratingKey})")
+                                logger.debug(f"✔️ Created Jellyfin track object from DB for '{db_track.title}' (ID: {actual_track.ratingKey})")
                                 return actual_track, confidence
+                                
                             elif server_type == "navidrome":
-                                # For Navidrome, create a track object from database info (similar to Jellyfin)
                                 class NavidromeTrackFromDB:
                                     def __init__(self, db_track):
                                         self.ratingKey = db_track.id
@@ -399,38 +424,154 @@ class PlaylistSyncService:
                                         self.id = db_track.id
 
                                 actual_track = NavidromeTrackFromDB(db_track)
-                                logger.debug(f"✔️ Created Navidrome track object for '{db_track.title}' (ID: {actual_track.ratingKey})")
+                                logger.debug(f"✔️ Created Navidrome track object from DB for '{db_track.title}' (ID: {actual_track.ratingKey})")
                                 return actual_track, confidence
+                                
                             else:
-                                # For Plex, use the original fetchItem approach
-                                # Validate that the track ID is numeric (Plex requirement)
+                                # Plex fetchItem
                                 try:
                                     track_id = int(db_track.id)
                                     actual_plex_track = media_client.server.fetchItem(track_id)
                                     if actual_plex_track and hasattr(actual_plex_track, 'ratingKey'):
                                         logger.debug(f"✔️ Successfully fetched actual Plex track for '{db_track.title}' (ratingKey: {actual_plex_track.ratingKey})")
                                         return actual_plex_track, confidence
-                                    else:
-                                        logger.warning(f"❌ Fetched Plex track for '{db_track.title}' lacks ratingKey attribute")
+                                        
                                 except ValueError:
-                                    logger.warning(f"❌ Invalid Plex track ID format for '{db_track.title}' (ID: {db_track.id}) - skipping this track")
                                     continue
                                 
                         except Exception as fetch_error:
                             logger.error(f"❌ Failed to fetch actual {server_type} track for '{db_track.title}' (ID: {db_track.id}): {fetch_error}")
-                            # Continue to try other artists rather than fail completely
                             continue
                         
                 except Exception as db_error:
                     logger.error(f"Error checking track existence for '{original_title}' by '{artist_name}': {db_error}")
                     continue
             
-            logger.debug(f"❌ No database match found for '{original_title}' by any of the artists {spotify_track.artists}")
+            logger.debug(f"❌ No match found (API, File, or DB) for '{original_title}'")
             return None, 0.0
             
         except Exception as e:
             logger.error(f"Error searching for track '{spotify_track.name}': {e}")
             return None, 0.0
+
+    async def _check_jellyfin_api(self, media_client, spotify_track: SpotifyTrack):
+        """Check if track exists directly in Jellyfin via API search."""
+        try:
+            if not hasattr(media_client, 'search_tracks_by_metadata'):
+                return None
+                
+            title = spotify_track.name
+            
+            # Try each artist
+            for artist in spotify_track.artists:
+                if self._cancelled:
+                    return None
+                    
+                # Extract artist name
+                if isinstance(artist, str):
+                    artist_name = artist
+                elif isinstance(artist, dict) and 'name' in artist:
+                    artist_name = artist['name']
+                else:
+                    artist_name = str(artist)
+                
+                # Call the new search method
+                match = media_client.search_tracks_by_metadata(title, artist_name)
+                if match:
+                    logger.info(f"✅ Found track in Jellyfin API: {title} by {artist_name}")
+                    return match
+                    
+            return None
+        except Exception as e:
+            logger.error(f"Error in Jellyfin API check: {e}")
+            return None
+
+    def _check_filesystem(self, spotify_track: SpotifyTrack, media_client=None):
+        """Check if track file exists in the transfer_path folder using fuzzy filename matching."""
+        try:
+            from config.settings import config_manager
+            
+            # Get transfer path
+            transfer_path_str = config_manager.get('soulseek.transfer_path', './Transfer')
+            
+            # Safe resolve function similar to web_server.py
+            def resolve_path(path_str):
+                return os.path.abspath(os.path.expanduser(path_str))
+                
+            transfer_dir = Path(resolve_path(transfer_path_str))
+            
+            if not transfer_dir.exists():
+                return None
+                
+            # Prepare search terms
+            safe_title = "".join(c for c in spotify_track.name if c.isalnum() or c in " -_").lower()
+            if len(safe_title) < 3: # Too short is dangerous for fuzzy match
+                return None
+                
+            # Try simple glob matching first (fast)
+            # Create a simplified version of the title for matching
+            search_pattern = f"*{safe_title}*"
+            
+            # Search recursively
+            try:
+                # Use glob.glob with recursive=True
+                # Match against common audio extensions
+                extensions = ['.mp3', '.flac', '.m4a', '.wav', '.opus', '.ogg']
+                
+                # Check for artist folders first (optimization)
+                for artist in spotify_track.artists:
+                    if isinstance(artist, str):
+                        artist_name = artist
+                    else:
+                        artist_name = artist.get('name', str(artist))
+                        
+                    # Sanitize artist name for path
+                    safe_artist = "".join(c for c in artist_name if c.isalnum() or c in " -_").strip()
+                    if not safe_artist:
+                        continue
+                        
+                    # Look for artist folder
+                    artist_folders = list(transfer_dir.glob(f"*{safe_artist}*"))
+                    
+                    search_roots = artist_folders if artist_folders else [transfer_dir]
+                    
+                    for root in search_roots:
+                        # Walk this directory looking for the track
+                        for path in root.rglob("*"):
+                            if path.is_file() and path.suffix.lower() in extensions:
+                                if safe_title in path.name.lower():
+                                    
+                                    # Found the file! Now try to get the real Jellyfin ID if possible
+                                    if media_client and hasattr(media_client, 'get_track_by_filename'):
+                                        logger.info(f"🔍 Found file '{path.name}', attempting to resolve Jellyfin ID...")
+                                        jellyfin_track = media_client.get_track_by_filename(path.name)
+                                        if jellyfin_track:
+                                            logger.info(f"✅ Resolved Jellyfin ID for '{path.name}': {jellyfin_track.ratingKey}")
+                                            return jellyfin_track
+                                    
+                                    logger.info(f"✅ Found track on filesystem: {path.name} (ID resolution failed/skipped)")
+                                    
+                                    # Create a dummy track object so the interface is satisfied
+                                    # This won't have a valid ID for playlist syncing until Jellyfin scans it,
+                                    # but it prevents re-downloading
+                                    class FileSystemTrack:
+                                        def __init__(self, path, title, artist):
+                                            self.ratingKey = f"fs_{path.stat().st_ino}" # Use inode as fake ID
+                                            self.title = title
+                                            self.id = self.ratingKey
+                                            self.is_file_match = True
+                                            self.file_path = str(path)
+                                            
+                                    return FileSystemTrack(path, spotify_track.name, artist_name)
+                                    
+            except Exception as e:
+                logger.error(f"Error during filesystem glob: {e}")
+                
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error checking filesystem for {spotify_track.name}: {e}")
+            return None
     
     async def sync_multiple_playlists(self, playlist_names: List[str], download_missing: bool = False) -> List[SyncResult]:
         results = []
