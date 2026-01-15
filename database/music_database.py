@@ -2065,7 +2065,37 @@ class MusicDatabase:
             
             # Direct similarity with Unicode normalization
             title_similarity = self._string_similarity(search_title_norm, db_title_norm)
+            
+            # Enhanced Artist Similarity: Handle multi-artist strings in database
+            # Example: Search "Chris Cardena" vs DB "Chris Cardena, Sebastian Robertson"
+            
+            # 1. Direct match (whole string)
             artist_similarity = self._string_similarity(search_artist_norm, db_artist_norm)
+            
+            # 2. Split DB artist into components and find best match
+            # Common separators: comma, semicolon, " feat. ", " ft. ", " & ", " / "
+            normalized_separators = [',', ';', '&', '/']
+            db_artist_cleaned = db_artist_norm
+            for sep in normalized_separators:
+                db_artist_cleaned = db_artist_cleaned.replace(sep, '|')
+            
+            # Also handle " feat " and " ft " variants
+            db_artist_cleaned = re.sub(r'\s+feat\.?\s+', '|', db_artist_cleaned)
+            db_artist_cleaned = re.sub(r'\s+ft\.?\s+', '|', db_artist_cleaned)
+            
+            artist_components = [c.strip() for c in db_artist_cleaned.split('|') if c.strip()]
+            
+            if len(artist_components) > 1:
+                best_component_similarity = 0.0
+                for component in artist_components:
+                    sim = self._string_similarity(search_artist_norm, component)
+                    if sim > best_component_similarity:
+                        best_component_similarity = sim
+                
+                # If component match is significantly better, use it
+                if best_component_similarity > artist_similarity:
+                    logger.debug(f"   👥 Multi-artist match: '{search_artist}' matches component '{[c for c in artist_components if self._string_similarity(search_artist_norm, c) == best_component_similarity][0]}' ({best_component_similarity:.3f}) better than full string ({artist_similarity:.3f})")
+                    artist_similarity = best_component_similarity
             
             # Also try with cleaned versions (removing parentheses, brackets, etc.)
             clean_search_title = self._clean_track_title_for_comparison(search_title)
