@@ -1219,6 +1219,7 @@ class JellyfinClient:
             from config.settings import config_manager
             create_backup = config_manager.get('playlist_sync.create_backup', True)
             
+            backup_name = None
             if existing_playlist and create_backup:
                 backup_name = f"{playlist_name} Backup"
                 logger.info(f"🛡️ Creating backup playlist '{backup_name}' before sync")
@@ -1227,6 +1228,7 @@ class JellyfinClient:
                     logger.info(f"✅ Backup created successfully")
                 else:
                     logger.warning(f"⚠️ Failed to create backup, continuing with sync")
+                    backup_name = None  # Don't try to delete if backup creation failed
             
             if existing_playlist:
                 # Delete existing playlist using DELETE request
@@ -1243,7 +1245,26 @@ class JellyfinClient:
                     logger.warning(f"Could not delete existing playlist '{playlist_name}' (status: {response.status_code}), creating anyway")
             
             # Create new playlist with tracks
-            return self.create_playlist(playlist_name, tracks)
+            success = self.create_playlist(playlist_name, tracks)
+            
+            # If playlist creation succeeded and we created a backup, delete the backup
+            # The backup was only a safety net during the sync process
+            if success and backup_name:
+                import requests
+                backup_playlist = self.get_playlist_by_name(backup_name)
+                if backup_playlist:
+                    del_url = f"{self.base_url}/Items/{backup_playlist.id}"
+                    del_headers = {'X-Emby-Token': self.api_key}
+                    try:
+                        del_response = requests.delete(del_url, headers=del_headers, timeout=10)
+                        if del_response.status_code in [200, 204]:
+                            logger.info(f"🧹 Deleted backup playlist '{backup_name}' after successful sync")
+                        else:
+                            logger.warning(f"⚠️ Could not delete backup playlist '{backup_name}' (status: {del_response.status_code})")
+                    except Exception as del_error:
+                        logger.warning(f"⚠️ Error deleting backup playlist '{backup_name}': {del_error}")
+            
+            return success
             
         except Exception as e:
             logger.error(f"Error updating Jellyfin playlist '{playlist_name}': {e}")
