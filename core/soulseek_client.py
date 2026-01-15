@@ -2,6 +2,7 @@ import requests
 import asyncio
 import aiohttp
 import os
+import threading
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 import time
@@ -201,6 +202,9 @@ class DownloadStatus:
     file_path: Optional[str] = None
 
 class SoulseekClient:
+    # Class-level lock to serialize all API requests (slskd only allows one concurrent operation)
+    _api_lock = threading.Lock()
+    
     def __init__(self):
         self.base_url: Optional[str] = None
         self.api_key: Optional[str] = None
@@ -293,63 +297,84 @@ class SoulseekClient:
         
         url = f"{self.base_url}/api/v0/{endpoint}"
         
-        # Create a fresh session for each thread/event loop to avoid conflicts
-        session = None
-        try:
-            session = aiohttp.ClientSession()
-            
-            headers = self._get_headers()
-         
-            if 'json' in kwargs:
-                logger.debug(f"JSON payload: {kwargs['json']}")
-            
-            async with session.request(
-                method, 
-                url, 
-                headers=headers,
-                **kwargs
-            ) as response:
-                response_text = await response.text()
-             
-                
-                if response.status in [200, 201, 204]:  # Accept 200 OK, 201 Created, and 204 No Content
-                    try:
-                        if response_text.strip():  # Only parse if there's content
-                            return await response.json()
-                        else:
-                            # Return empty dict for successful requests with no content (like 201 Created)
-                            return {}
-                    except:
-                        # If response_text was already consumed, parse it manually
-                        import json
-                        if response_text.strip():
-                            return json.loads(response_text)
-                        else:
-                            return {}
-                else:
-                    # Enhanced error logging for better debugging
-                    error_detail = response_text if response_text.strip() else "No error details provided"
-                    
-                    # Reduce noise for expected 404s during search cleanup
-                    # Reduce noise for expected 404s (e.g. status checks for YouTube downloads)
-                    if response.status == 404:
-                        logger.debug(f"API request returned 404 (Not Found) for {url}")
-                    else:
-                        logger.error(f"API request failed: HTTP {response.status} ({response.reason}) - {error_detail}")
-                        logger.debug(f"Failed request: {method} {url}")
-                    
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"Error making API request: {e}")
-            return None
-        finally:
-            # Always clean up the session
-            if session:
+        # Retry configuration for 429 errors
+        max_retries = 3
+        base_delay = 0.5  # Start with 500ms delay
+        
+        # Acquire lock to ensure only one API request at a time (slskd requirement)
+        # Using threading.Lock since this async method is called from various threads via asyncio.run()
+        with SoulseekClient._api_lock:
+            for attempt in range(max_retries):
+                # Create a fresh session for each attempt
+                session = None
                 try:
-                    await session.close()
-                except:
-                    pass
+                    session = aiohttp.ClientSession()
+                    
+                    headers = self._get_headers()
+                 
+                    if 'json' in kwargs:
+                        logger.debug(f"JSON payload: {kwargs['json']}")
+                    
+                    async with session.request(
+                        method, 
+                        url, 
+                        headers=headers,
+                        **kwargs
+                    ) as response:
+                        response_text = await response.text()
+                     
+                        # Handle 429 with retry
+                        if response.status == 429:
+                            if attempt < max_retries - 1:
+                                delay = base_delay * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
+                                logger.warning(f"HTTP 429 received, waiting {delay}s before retry (attempt {attempt + 1}/{max_retries})")
+                                await asyncio.sleep(delay)
+                                continue  # Retry
+                            else:
+                                logger.error(f"HTTP 429 after {max_retries} retries for {method} {endpoint}")
+                                return None
+                        
+                        if response.status in [200, 201, 204]:  # Accept 200 OK, 201 Created, and 204 No Content
+                            try:
+                                if response_text.strip():  # Only parse if there's content
+                                    return await response.json()
+                                else:
+                                    # Return empty dict for successful requests with no content (like 201 Created)
+                                    return {}
+                            except:
+                                # If response_text was already consumed, parse it manually
+                                import json
+                                if response_text.strip():
+                                    return json.loads(response_text)
+                                else:
+                                    return {}
+                        else:
+                            # Enhanced error logging for better debugging
+                            error_detail = response_text if response_text.strip() else "No error details provided"
+                            
+                            # Reduce noise for expected 404s during search cleanup
+                            # Reduce noise for expected 404s (e.g. status checks for YouTube downloads)
+                            if response.status == 404:
+                                logger.debug(f"API request returned 404 (Not Found) for {url}")
+                            else:
+                                logger.error(f"API request failed: HTTP {response.status} ({response.reason}) - {error_detail}")
+                                logger.debug(f"Failed request: {method} {url}")
+                            
+                            return None
+                            
+                except Exception as e:
+                    logger.error(f"Error making API request: {e}")
+                    return None
+                finally:
+                    # Always clean up the session
+                    if session:
+                        try:
+                            await session.close()
+                        except:
+                            pass
+            
+            # Should not reach here, but just in case
+            return None
     
     async def _make_direct_request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict[str, Any]]:
         """Make a direct request to slskd without /api/v0/ prefix (for endpoints that work directly)"""
@@ -359,46 +384,66 @@ class SoulseekClient:
         
         url = f"{self.base_url}/{endpoint}"
         
-        # Create a fresh session for each thread/event loop to avoid conflicts
-        session = None
-        try:
-            session = aiohttp.ClientSession()
-            
-            headers = self._get_headers()
-          
-            if 'json' in kwargs:
-                logger.debug(f"JSON payload: {kwargs['json']}")
-            
-            async with session.request(
-                method, 
-                url, 
-                headers=headers,
-                **kwargs
-            ) as response:
-                response_text = await response.text()
-             
-                
-                if response.status == 200:
-                    try:
-                        return await response.json()
-                    except:
-                        # If response_text was already consumed, parse it manually
-                        import json
-                        return json.loads(response_text)
-                else:
-                    logger.error(f"Direct API request failed: {response.status} - {response_text}")
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"Error making direct API request: {e}")
-            return None
-        finally:
-            # Always clean up the session
-            if session:
+        # Retry configuration for 429 errors
+        max_retries = 3
+        base_delay = 0.5  # Start with 500ms delay
+        
+        # Acquire lock to ensure only one API request at a time (slskd requirement)
+        with SoulseekClient._api_lock:
+            for attempt in range(max_retries):
+                # Create a fresh session for each attempt
+                session = None
                 try:
-                    await session.close()
-                except:
-                    pass
+                    session = aiohttp.ClientSession()
+                    
+                    headers = self._get_headers()
+                  
+                    if 'json' in kwargs:
+                        logger.debug(f"JSON payload: {kwargs['json']}")
+                    
+                    async with session.request(
+                        method, 
+                        url, 
+                        headers=headers,
+                        **kwargs
+                    ) as response:
+                        response_text = await response.text()
+                     
+                        # Handle 429 with retry
+                        if response.status == 429:
+                            if attempt < max_retries - 1:
+                                delay = base_delay * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
+                                logger.warning(f"HTTP 429 received (direct), waiting {delay}s before retry (attempt {attempt + 1}/{max_retries})")
+                                await asyncio.sleep(delay)
+                                continue  # Retry
+                            else:
+                                logger.error(f"HTTP 429 after {max_retries} retries for direct {method} {endpoint}")
+                                return None
+                        
+                        if response.status == 200:
+                            try:
+                                return await response.json()
+                            except:
+                                # If response_text was already consumed, parse it manually
+                                import json
+                                return json.loads(response_text)
+                        else:
+                            logger.error(f"Direct API request failed: {response.status} - {response_text}")
+                            return None
+                            
+                except Exception as e:
+                    logger.error(f"Error making direct API request: {e}")
+                    return None
+                finally:
+                    # Always clean up the session
+                    if session:
+                        try:
+                            await session.close()
+                        except:
+                            pass
+            
+            # Should not reach here, but just in case
+            return None
     
     def _process_search_responses(self, responses_data: List[Dict[str, Any]]) -> tuple[List[TrackResult], List[AlbumResult]]:
         """Process search response data into TrackResult and AlbumResult objects"""
